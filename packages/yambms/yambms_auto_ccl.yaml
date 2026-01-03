@@ -78,7 +78,7 @@ sensor:
     id:  auto_ccl_moving_average
     unit_of_measurement: A
     device_class: current
-    internal: true
+    internal: false
     filters:
     - exponential_moving_average:
         alpha: 0.15
@@ -94,10 +94,16 @@ sensor:
     unit_of_measurement: A
     device_class: current
     accuracy_decimals: 1
-    internal: true
+    internal: false
     filters:
     - lambda: !lambda |-
-              // Variables
+              // Hard OFF means OFF (no EMA residue)
+              if (!id(${yambms_id}_switch_auto_ccl).state) {
+                id(${yambms_id}_auto_ccl) = 0.0;
+                return 0.0;
+              }
+              
+              // Variables              
               double auto_ccl = round((min(id(auto_ccl_moving_average).state, x) * 10) / 10);
 
               id(${yambms_id}_auto_ccl) = auto_ccl;
