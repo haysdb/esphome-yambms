@@ -1,0 +1,205 @@
+#--------------------------------------------------------------------------------------------
+# Auto CVL Dynamic Offset
+#
+# Purpose:
+#   Extra CVL via var_auto_custom_cvl (leaves stock var_auto_cvl for upstream Auto CVL).
+#   - At Current Taper knee: apply Charging Offset (default 0.5 V)
+#   - At first bulk touch: drop to Balance Offset (default 0.1 V)
+#   - Active while not EOC and pack ≥ knee (cleared while EOC; re-activates if
+#     EOC clears with pack still above knee).
+#   - Manual Offset switch: when on, use Manual Offset (−0.5…+0.5 V) in every
+#     session phase (pre-bulk charging and after bulk latch); when off, use auto.
+#
+# Shares Current Taper's knee + SMA pack voltage for now (same handoff window).
+# Requires packages/yambms/yambms_auto_ccl_current_taper.yaml in the build.
+#
+# Auto Float interaction:
+#   While EOC is latched, Active stays false. If EOC clears and pack is still
+#   ≥ knee, Active comes back on (often already ≥ bulk → Balance Offset).
+#
+# Contract:
+#   - Writes: id(yambms${yambms_id}_var_auto_custom_cvl)
+#   - Reads:  CT knee + CT SMA voltage, bulk_voltage, var_eoc
+#--------------------------------------------------------------------------------------------
+
+switch:
+  - platform: template
+    id: yambms${yambms_id}_switch_auto_cvl_dyn
+    device_id: yambms_yambms${yambms_id}
+    name: "Auto CVL Dynamic Offset"
+    restore_mode: RESTORE_DEFAULT_OFF
+    optimistic: true
+    entity_category: config
+
+  - platform: template
+    id: yambms${yambms_id}_switch_auto_cvl_man
+    device_id: yambms_yambms${yambms_id}
+    name: "Auto CVL Manual Offset"
+    restore_mode: RESTORE_DEFAULT_OFF
+    optimistic: true
+    entity_category: config
+
+number:
+  # Offset from knee until first bulk touch
+  - platform: template
+    id: yambms${yambms_id}_number_auto_cvl_dyn_charging_v
+    device_id: yambms_yambms${yambms_id}
+    name: "Auto CVL Dyn Charging Offset"
+    unit_of_measurement: V
+    device_class: voltage
+    min_value: 0
+    max_value: 1
+    step: 0.1
+    mode: ${yambms_input_number_mode}
+    restore_value: true
+    optimistic: true
+    initial_value: 0.5
+    entity_category: config
+    icon: mdi:battery-arrow-up
+
+  # Offset after first bulk touch (until EOC)
+  - platform: template
+    id: yambms${yambms_id}_number_auto_cvl_dyn_balance_v
+    device_id: yambms_yambms${yambms_id}
+    name: "Auto CVL Dyn Balance Offset"
+    unit_of_measurement: V
+    device_class: voltage
+    min_value: 0
+    max_value: 0.6
+    step: 0.1
+    mode: ${yambms_input_number_mode}
+    restore_value: true
+    optimistic: true
+    initial_value: 0.1
+    entity_category: config
+    icon: mdi:battery-arrow-down
+
+  # Live override when Manual Offset switch is on
+  - platform: template
+    id: yambms${yambms_id}_number_auto_cvl_man_v
+    device_id: yambms_yambms${yambms_id}
+    name: "Auto CVL Manual Offset"
+    unit_of_measurement: V
+    device_class: voltage
+    min_value: -0.5
+    max_value: 0.6
+    step: 0.1
+    mode: ${yambms_input_number_mode}
+    restore_value: true
+    optimistic: true
+    initial_value: 0.0
+    entity_category: config
+    icon: mdi:tune-vertical
+
+sensor:
+  # Applied var_auto_custom_cvl (diagnostic)
+  - platform: template
+    name: "Auto CVL Dyn Offset"
+    id: yambms${yambms_id}_auto_cvl_dyn_offset
+    device_id: yambms_yambms${yambms_id}
+    unit_of_measurement: V
+    device_class: voltage
+    accuracy_decimals: 1
+    update_interval: never
+    entity_category: diagnostic
+    icon: mdi:sine-wave
+
+  # Pack V used for knee/bulk decisions (same source as the lambda)
+  - platform: template
+    name: "Auto CVL Dyn Pack V"
+    id: yambms${yambms_id}_auto_cvl_dyn_pack_v
+    device_id: yambms_yambms${yambms_id}
+    unit_of_measurement: V
+    device_class: voltage
+    accuracy_decimals: 3
+    update_interval: never
+    entity_category: diagnostic
+    icon: mdi:sine-wave
+
+binary_sensor:
+  - platform: template
+    name: "Auto CVL Dyn Active"
+    id: yambms${yambms_id}_auto_cvl_dyn_active
+    device_id: yambms_yambms${yambms_id}
+    entity_category: diagnostic
+    icon: mdi:lightning-bolt
+
+  - platform: template
+    name: "Auto CVL Dyn Bulk Latched"
+    id: yambms${yambms_id}_auto_cvl_dyn_bulk_latched
+    device_id: yambms_yambms${yambms_id}
+    entity_category: diagnostic
+    icon: mdi:anchor
+
+interval:
+  - interval: ${yambms_update_interval}
+    then:
+      - lambda: |-
+          //--------------------------------------------------------------------
+          // Internal state
+          //--------------------------------------------------------------------
+          static bool active       = false;   // At/above CT knee this session
+          static bool bulk_latched = false;   // Pack has touched bulk this session
+
+          //--------------------------------------------------------------------
+          // Gate: Feature enabled?
+          //--------------------------------------------------------------------
+          if (!id(yambms${yambms_id}_switch_auto_cvl_dyn).state) {
+            active = false;
+            bulk_latched = false;
+            id(yambms${yambms_id}_var_auto_custom_cvl) = 0.0f;
+            id(yambms${yambms_id}_auto_cvl_dyn_offset).publish_state(0.0f);
+            id(yambms${yambms_id}_auto_cvl_dyn_active).publish_state(false);
+            id(yambms${yambms_id}_auto_cvl_dyn_bulk_latched).publish_state(false);
+            return;
+          }
+
+          //--------------------------------------------------------------------
+          // Inputs (shared with Current Taper for now)
+          //--------------------------------------------------------------------
+          const float V_knee     = id(yambms${yambms_id}_number_auto_ccl_ct_knee_v).state;      // CT knee voltage
+          const float V_bulk     = id(yambms${yambms_id}_bulk_voltage).state;                   // bulk voltage
+          const float V_pack     = id(yambms${yambms_id}_auto_ccl_ct_voltage).has_state()       // CT SMA pack V
+              ? id(yambms${yambms_id}_auto_ccl_ct_voltage).state
+              : id(yambms${yambms_id}_total_voltage).state;
+          const bool  eoc_done   = id(yambms${yambms_id}_var_eoc);                              // EOC reached
+          const float V_off_chg  = id(yambms${yambms_id}_number_auto_cvl_dyn_charging_v).state; // Charging Offset e.g. 0.5 V
+          const float V_off_bal  = id(yambms${yambms_id}_number_auto_cvl_dyn_balance_v).state;  // Balance Offset e.g. 0.1 V
+
+          float offset = 0.0f;
+
+          //--------------------------------------------------------------------
+          // Session: inactive while EOC; otherwise active whenever V ≥ knee
+          // (includes re-activate after EOC clears with pack still above knee).
+          //--------------------------------------------------------------------
+          if (eoc_done) {
+            active = false;
+            bulk_latched = false;
+          } else if (V_pack >= V_knee) {
+            if (!active) {
+              active = true;
+              // Re-entry often already ≥ bulk → latch immediately
+              bulk_latched = (V_pack >= V_bulk);
+            } else if (!bulk_latched && V_pack >= V_bulk) {
+              bulk_latched = true;
+            }
+          }
+
+          //--------------------------------------------------------------------
+          // Desired var_auto_custom_cvl
+          // Manual on → number (any phase, including after bulk latch)
+          // Manual off → auto Charging / Balance from session
+          //--------------------------------------------------------------------
+          if (id(yambms${yambms_id}_switch_auto_cvl_man).state) {
+            offset = id(yambms${yambms_id}_number_auto_cvl_man_v).state;
+          } else if (active) {
+            offset = bulk_latched ? V_off_bal : V_off_chg;
+          } else {
+            offset = 0.0f;
+          }
+
+          id(yambms${yambms_id}_var_auto_custom_cvl) = offset;
+          id(yambms${yambms_id}_auto_cvl_dyn_offset).publish_state(offset);
+          id(yambms${yambms_id}_auto_cvl_dyn_pack_v).publish_state(V_pack);
+          id(yambms${yambms_id}_auto_cvl_dyn_active).publish_state(active);
+          id(yambms${yambms_id}_auto_cvl_dyn_bulk_latched).publish_state(bulk_latched);

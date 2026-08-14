@@ -29,5 +29,7 @@ packages:
   yambms_auto_6: !include yambms_auto_temp_ccl_dcl.yaml
   yambms_auto_7: !include yambms_auto_soc_limit.yaml
   yambms_auto_8: !include yambms_auto_ccl_current_taper.yaml
+  # Fork (haysdb): extra Bulk CVL via var_auto_custom_cvl; requires Current Taper
+  yambms_auto_9: !include yambms_auto_cvl_dynamic_offset.yaml
   # Update service
   yambms_service: !include yambms_service.yaml
