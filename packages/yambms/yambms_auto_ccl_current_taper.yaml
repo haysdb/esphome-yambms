@@ -23,11 +23,11 @@
 # Purpose:
 #   1) Taper CCL from knee to bulk so the pack reaches bulk cleanly.
 #   2) At bulk latch: drop CCL to Balance Current.
-#   3) After EOC: keep CCL at Balance Current (or Dyn hunt) until pack ≤
-#      max(float − 0.4 V, Rebulk V.), then release.
+#   3) After EOC: keep CCL at Balance Current (or Dyn hunt) until pack ≤ Rebulk V.,
+#      then release.
 #   4) Session release:
 #        - Before bulk: pack ≤ knee − hysteresis (~0.2 V @ 16S)
-#        - After bulk:  pack ≤ max(float − 0.4 V, Rebulk V.)
+#        - After bulk:  pack ≤ Rebulk V.
 #   5) Do not activate until battery SoC ≥ Min SoC number (default 95%).
 #   6) Optional Dynamic Balance Current (second interval, not a baton step):
 #      - Seeds from Balance Current number (never modifies that number).
@@ -38,7 +38,7 @@
 #
 # Publishes:
 #   binary_sensor …_auto_ccl_ct_balancing_active
-#     = CT session active && bulk latched (through post-EOC until post-bulk release)
+#     = CT session active && bulk latched (through post-EOC until Rebulk V.)
 #
 # Contract with yambms_core.yaml (upstream/dev):
 #   - Participates in Auto CCL STEP pipeline
@@ -365,11 +365,8 @@ interval:
               ? id(yambms${yambms_id}_auto_ccl_ct_voltage).state
               : id(yambms${yambms_id}_total_voltage).state;
           const bool  eoc_done  = id(yambms${yambms_id}_var_eoc);                               // EOC reached
-          const float V_float   = id(yambms${yambms_id}_float_voltage).state;                   // float voltage
-          const float V_rebulk  = id(yambms${yambms_id}_rebulk_voltage).state;                  // rebulk pack V
+          const float V_rebulk  = id(yambms${yambms_id}_rebulk_voltage).state;                  // post-bulk release
           const float V_hyst    = 0.0125f * ${yambms_cell_count};                               // knee hysteresis (0.2 V @ 16S)
-          // Post-bulk release: deeper into float than knee hyst, but never below rebulk
-          const float V_release_post_bulk = fmaxf(V_float - 0.4f, V_rebulk);
           const float min_soc   = id(yambms${yambms_id}_number_auto_ccl_ct_min_soc).state;
 
           float I_target = I_max;
@@ -405,7 +402,7 @@ interval:
           //--------------------------------------------------------------------
           // Session: activate at knee + min SoC
           //   Before bulk: release at knee − hysteresis
-          //   After bulk:  release at max(float − 0.4 V, Rebulk V.) (incl. post-EOC)
+          //   After bulk:  release at Rebulk V. (incl. post-EOC)
           //--------------------------------------------------------------------
           const bool soc_ok = id(yambms${yambms_id}_battery_soc).has_state() &&
                               (id(yambms${yambms_id}_battery_soc).state >= min_soc);
@@ -422,7 +419,7 @@ interval:
           } else if (active && !bulk_latched && V_pack <= (V_knee - V_hyst)) {
             active = false;
             bulk_latched = false;
-          } else if (active && bulk_latched && V_pack <= V_release_post_bulk) {
+          } else if (active && bulk_latched && V_pack <= V_rebulk) {
             active = false;
             bulk_latched = false;
           } else if (active && !bulk_latched && V_pack >= V_bulk) {
@@ -435,7 +432,7 @@ interval:
           if (active) {
             if (bulk_latched || eoc_done) {
               // Bulk latch or post-EOC: Balance Current (or Dyn live) until
-              // session releases at max(float − 0.4 V, Rebulk V.)
+              // session releases at Rebulk V.
               I_target = I_balance;
             } else {
               float p = (V_pack - V_knee) / (V_bulk - V_knee);              // 0 at knee → 1 at bulk
@@ -457,7 +454,7 @@ interval:
           }
 
           // Arming window: bulk-latched Balance Current path (through post-EOC
-          // until post-bulk release)
+          // until Rebulk V. release)
           id(yambms${yambms_id}_auto_ccl_ct_balancing_active).publish_state(
               active && bulk_latched);
 
