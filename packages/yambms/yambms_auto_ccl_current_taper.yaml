@@ -1,6 +1,6 @@
-# Updated : 2026.08.11
-# Version : 1.1.2
-# GitHub  : https://github.com/Sleeper85/esphome-yambms
+# Updated : 2026.08.16
+# Version : 1.2.0
+# GitHub  : https://github.com/haysdb/esphome-yambms (based on Sleeper85 1.1.2)
 
 # YamBMS ( Yet another multi-BMS Merging Solution )
 
@@ -22,7 +22,23 @@
 #
 # Purpose:
 #   1) Taper CCL from knee to bulk so the pack reaches bulk cleanly.
-#   2) At bulk (or earlier EOC), drop CCL to Balance Current while the session is active.
+#   2) At bulk latch: drop CCL to Balance Current.
+#   3) After EOC: keep CCL at Balance Current (or Dyn hunt) until pack ≤
+#      max(float − 0.4 V, Rebulk V.), then release.
+#   4) Session release:
+#        - Before bulk: pack ≤ knee − hysteresis (~0.2 V @ 16S)
+#        - After bulk:  pack ≤ max(float − 0.4 V, Rebulk V.)
+#   5) Do not activate until battery SoC ≥ Min SoC number (default 95%).
+#   6) Optional Dynamic Balance Current (second interval, not a baton step):
+#      - Seeds from Balance Current number (never modifies that number).
+#      - Polls on yambms_update_interval; ±1 A at most once per step_s.
+#      - Before EOC: ±1 A on live hunt to hold pack V near Bulk − ref offset.
+#      - After EOC (while still on Balance Current): reduce-only — if pack rises
+#        band above that ref, step −1 A down to Dyn Balance Min (no increases).
+#
+# Publishes:
+#   binary_sensor …_auto_ccl_ct_balancing_active
+#     = CT session active && bulk latched (through post-EOC until post-bulk release)
 #
 # Contract with yambms_core.yaml (upstream/dev):
 #   - Participates in Auto CCL STEP pipeline
@@ -31,12 +47,22 @@
 #     restarting the pipeline at step 1, so staying silent (feature disabled,
 #     gated out, or not our turn yet) is equivalent to writing 0.
 #   - Advances pipeline via: id(yambms${yambms_id}_var_charge_current_step)++
+#   - Dynamic Balance Current seeds from number_auto_ccl_ct_balance_a (never writes it);
+#     live hunt is auto_ccl_ct_vhold_a only (no baton write)
 #--------------------------------------------------------------------------------------------
 
 substitutions:
   # Curve shape vs pack voltage progress (compile-time; override at package include).
   # 1.0 = linear; >1 drops faster early then longer tail; <1 delays taper then sharpens near bulk.
   auto_ccl_ct_curve_exp: "1.0"
+
+  # Dynamic Balance Current: hunt reference = Bulk − this (V). Hunt the held pack
+  # voltage (often slightly below CVL), not the CVL setpoint itself.
+  auto_ccl_ct_vhold_ref_offset_v: "0.1"
+  # Dynamic Balance Current: dead-band around hunt ref (V)
+  auto_ccl_ct_vhold_band_v: "0.015"
+  # Dynamic Balance Current: min time between ±1 A steps (system response)
+  auto_ccl_ct_vhold_step_s: "120"
 
 esphome:
   on_boot:
@@ -70,6 +96,14 @@ switch:
     id: yambms${yambms_id}_switch_auto_ccl_current_taper
     device_id: yambms_yambms${yambms_id}
     name: "Auto CCL Current Taper"
+    restore_mode: RESTORE_DEFAULT_OFF
+    optimistic: true
+    entity_category: config
+
+  - platform: template
+    id: yambms${yambms_id}_switch_auto_ccl_ct_vhold
+    device_id: yambms_yambms${yambms_id}
+    name: "Auto CCL CT Dynamic Balance Current"
     restore_mode: RESTORE_DEFAULT_OFF
     optimistic: true
     entity_category: config
@@ -109,30 +143,28 @@ number:
     entity_category: config
     icon: mdi:current-dc
 
-  # Bulk / end-of-curve C-rate (× capacity → CCL at bulk, before Balance Current step)
+  # Bulk / end-of-curve current (A) — curve right end, before Balance Current step.
+  # Amps (not C-rate) so small end-of-curve currents stay usable on large packs.
   - platform: template
-    id: yambms${yambms_id}_number_auto_ccl_ct_bulk_c_rate
+    id: yambms${yambms_id}_number_auto_ccl_ct_bulk_a
     device_id: yambms_yambms${yambms_id}
-    name: "Auto CCL CT Bulk C-Rate"
-    unit_of_measurement: "C"
-    max_value: 0.1
-    min_value: 0.0
-    step: 0.005
+    name: "Auto CCL CT Bulk Amps"
+    unit_of_measurement: A
+    device_class: current
+    max_value: 50
+    min_value: 1
+    step: 1
     mode: ${yambms_input_number_mode}
     restore_value: true
     optimistic: true
-    initial_value: 0.03
+    initial_value: 15
     entity_category: config
     icon: mdi:current-dc
 
-  # Balance current (A) while latched at bulk / after EOC
-  # Min/max are updated at runtime from battery capacity (see the interval below);
-  # 0-50 are placeholders until the first capacity reading is available.
-  # Keep this above the Cut-Off Logic's current deadband (yambms_current_deadband_crate
-  # x capacity, e.g. 1.4 A @ 280 Ah/0.005C) — below it, the compensated voltage
-  # criterion in yambms_core.yaml is skipped and charge termination relies solely on
-  # the "fully charged at rest" signature. The default (2 A) is close to that limit
-  # on large packs: lower it with capacity in mind.
+  # Balance current seed (A) while latched at bulk / after EOC
+  # Dynamic Balance Current reads this as seed only and never modifies it.
+  # Min/max scale with capacity at runtime (see interval); 0–50 are placeholders.
+  # Keep above Cut-Off current deadband (yambms_current_deadband_crate × capacity).
   - platform: template
     id: yambms${yambms_id}_number_auto_ccl_ct_balance_a
     device_id: yambms_yambms${yambms_id}
@@ -146,6 +178,55 @@ number:
     restore_value: true
     optimistic: true
     initial_value: 2
+    entity_category: config
+    icon: mdi:current-dc
+
+  # Min battery SoC (%) before a taper session may start (knee alone is not enough)
+  - platform: template
+    id: yambms${yambms_id}_number_auto_ccl_ct_min_soc
+    device_id: yambms_yambms${yambms_id}
+    name: "Auto CCL CT Min SoC"
+    unit_of_measurement: "%"
+    min_value: 80
+    max_value: 100
+    step: 1
+    mode: ${yambms_input_number_mode}
+    restore_value: true
+    optimistic: true
+    initial_value: 95
+    entity_category: config
+    icon: mdi:battery-50
+
+  # Dynamic Balance Current hunt clamp (A)
+  - platform: template
+    id: yambms${yambms_id}_number_auto_ccl_ct_vhold_i_min
+    device_id: yambms_yambms${yambms_id}
+    name: "Auto CCL CT Dyn Balance Min"
+    unit_of_measurement: A
+    device_class: current
+    min_value: 0
+    max_value: 50
+    step: 1
+    mode: ${yambms_input_number_mode}
+    restore_value: true
+    optimistic: true
+    initial_value: 0
+    entity_category: config
+    icon: mdi:current-dc
+
+  - platform: template
+    id: yambms${yambms_id}_number_auto_ccl_ct_vhold_i_max
+    device_id: yambms_yambms${yambms_id}
+    name: "Auto CCL CT Dyn Balance Max"
+    unit_of_measurement: A
+    device_class: current
+    min_value: 0
+    max_value: 50
+    step: 1
+    mode: ${yambms_input_number_mode}
+    restore_value: true
+    optimistic: true
+    initial_value: 3
     entity_category: config
     icon: mdi:current-dc
 
@@ -177,6 +258,18 @@ sensor:
     entity_category: diagnostic
     icon: mdi:current-dc
 
+  # Live Balance Current while Dynamic Balance Current is hunting (or seed when idle)
+  - platform: template
+    name: "Auto CCL CT Dyn Balance Current"
+    id: yambms${yambms_id}_auto_ccl_ct_vhold_a
+    device_id: yambms_yambms${yambms_id}
+    unit_of_measurement: A
+    device_class: current
+    accuracy_decimals: 0
+    update_interval: never
+    entity_category: diagnostic
+    icon: mdi:current-dc
+
   - platform: template
     name: "Auto CCL CT Knee Amps"
     id: yambms${yambms_id}_auto_ccl_ct_knee_amps
@@ -189,25 +282,23 @@ sensor:
     entity_category: diagnostic
     icon: mdi:current-dc
     lambda: |-
-      return roundf(id(yambms${yambms_id}_battery_capacity).state
-                  * id(yambms${yambms_id}_number_auto_ccl_ct_knee_c_rate).state);
+      const float raw = id(yambms${yambms_id}_battery_capacity).state
+                      * id(yambms${yambms_id}_number_auto_ccl_ct_knee_c_rate).state;
+      return 5.0f * roundf(raw / 5.0f);
 
+binary_sensor:
+  # Arming window for Dynamic Balance Current (second interval).
   - platform: template
-    name: "Auto CCL CT Bulk Amps"
-    id: yambms${yambms_id}_auto_ccl_ct_bulk_amps
+    name: "Auto CCL CT Dyn Balance Active"
+    id: yambms${yambms_id}_auto_ccl_ct_balancing_active
     device_id: yambms_yambms${yambms_id}
-    unit_of_measurement: A
-    device_class: current
-    state_class: measurement
-    accuracy_decimals: 0
-    update_interval: ${yambms_update_interval}
     entity_category: diagnostic
-    icon: mdi:current-dc
-    lambda: |-
-      return roundf(id(yambms${yambms_id}_battery_capacity).state
-                  * id(yambms${yambms_id}_number_auto_ccl_ct_bulk_c_rate).state);
+    icon: mdi:scale-balance
 
 interval:
+  #--------------------------------------------------------------------------
+  # Main: Auto CCL baton — taper curve + Balance Current after bulk latch
+  #--------------------------------------------------------------------------
   - interval: ${yambms_update_interval}
     then:
       - lambda: |-
@@ -233,6 +324,7 @@ interval:
             active = false;
             bulk_latched = false;
             id(yambms${yambms_id}_auto_ccl_ct_delta).publish_state(0.0f);
+            id(yambms${yambms_id}_auto_ccl_ct_balancing_active).publish_state(false);
             id(yambms${yambms_id}_var_charge_current_step)++;
             return;
           }
@@ -243,12 +335,12 @@ interval:
           const float cap_ah    = id(yambms${yambms_id}_battery_capacity).state;                // battery capacity
           const float I_max     = id(yambms${yambms_id}_max_charge_current).state;              // max charge current
           const float knee_c    = id(yambms${yambms_id}_number_auto_ccl_ct_knee_c_rate).state;  // knee C-rate
-          const float bulk_c    = id(yambms${yambms_id}_number_auto_ccl_ct_bulk_c_rate).state;  // bulk C-rate
-          const float I_knee    = cap_ah * knee_c;                                              // knee current
-          const float I_bulk    = cap_ah * bulk_c;                                              // bulk current
+          // Knee amps: capacity × C-rate, rounded to nearest 5 A
+          const float I_knee    = 5.0f * roundf((cap_ah * knee_c) / 5.0f);
+          const float I_bulk    = id(yambms${yambms_id}_number_auto_ccl_ct_bulk_a).state;      // bulk end-of-curve (A)
 
-          // Balance Current bounds scale with capacity (0.1C ceiling,
-          // same order as Bulk C-Rate's max) instead of a flat 50 A.
+          // Balance Current bounds scale with capacity (0.1C ceiling)
+          // instead of a flat 50 A.
           if (cap_ah > 0.0f) {
             const float balance_max = cap_ah * 0.1f;
             id(yambms${yambms_id}_number_auto_ccl_ct_balance_a).traits.set_max_value(balance_max);
@@ -256,8 +348,16 @@ interval:
             if (isnan(balance_v) || (balance_v > balance_max))
               id(yambms${yambms_id}_number_auto_ccl_ct_balance_a).publish_state(fminf(balance_v, balance_max));
           }
-          
-          const float I_balance = id(yambms${yambms_id}_number_auto_ccl_ct_balance_a).state;    // CCL while latched at bulk / EOC
+
+          // Seed from number; live hunt from Dyn Balance sensor when armed
+          float I_balance = id(yambms${yambms_id}_number_auto_ccl_ct_balance_a).state;
+          if (id(yambms${yambms_id}_switch_auto_ccl_ct_vhold).state &&
+              id(yambms${yambms_id}_auto_ccl_ct_balancing_active).state &&
+              id(yambms${yambms_id}_auto_ccl_ct_vhold_a).has_state() &&
+              !isnan(id(yambms${yambms_id}_auto_ccl_ct_vhold_a).state)) {
+            I_balance = id(yambms${yambms_id}_auto_ccl_ct_vhold_a).state;
+          }
+
           const float V_knee    = id(yambms${yambms_id}_number_auto_ccl_ct_knee_v).state;       // knee voltage
           const float V_bulk    = id(yambms${yambms_id}_bulk_voltage).state;                    // bulk voltage
           // Prefer SMA pack V; fall back to raw until the filter has a sample
@@ -265,7 +365,12 @@ interval:
               ? id(yambms${yambms_id}_auto_ccl_ct_voltage).state
               : id(yambms${yambms_id}_total_voltage).state;
           const bool  eoc_done  = id(yambms${yambms_id}_var_eoc);                               // EOC reached
-          const float V_hyst = 0.0125f * ${yambms_cell_count};                                  // release hysteresis below knee (0.2 V @ 16S)
+          const float V_float   = id(yambms${yambms_id}_float_voltage).state;                   // float voltage
+          const float V_rebulk  = id(yambms${yambms_id}_rebulk_voltage).state;                  // rebulk pack V
+          const float V_hyst    = 0.0125f * ${yambms_cell_count};                               // knee hysteresis (0.2 V @ 16S)
+          // Post-bulk release: deeper into float than knee hyst, but never below rebulk
+          const float V_release_post_bulk = fmaxf(V_float - 0.4f, V_rebulk);
+          const float min_soc   = id(yambms${yambms_id}_number_auto_ccl_ct_min_soc).state;
 
           float I_target = I_max;
           float delta    = 0.0f;
@@ -279,6 +384,7 @@ interval:
             active = false;
             bulk_latched = false;
             id(yambms${yambms_id}_auto_ccl_ct_delta).publish_state(0.0f);
+            id(yambms${yambms_id}_auto_ccl_ct_balancing_active).publish_state(false);
             id(yambms${yambms_id}_var_charge_current_step)++;
             return;
           }
@@ -291,14 +397,20 @@ interval:
             active = false;
             bulk_latched = false;
             id(yambms${yambms_id}_auto_ccl_ct_delta).publish_state(0.0f);
+            id(yambms${yambms_id}_auto_ccl_ct_balancing_active).publish_state(false);
             id(yambms${yambms_id}_var_charge_current_step)++;
             return;
           }
 
           //--------------------------------------------------------------------
-          // Session: activate at knee; stay active until 0.2 V below knee
+          // Session: activate at knee + min SoC
+          //   Before bulk: release at knee − hysteresis
+          //   After bulk:  release at max(float − 0.4 V, Rebulk V.) (incl. post-EOC)
           //--------------------------------------------------------------------
-          if (!active && V_pack >= V_knee) {
+          const bool soc_ok = id(yambms${yambms_id}_battery_soc).has_state() &&
+                              (id(yambms${yambms_id}_battery_soc).state >= min_soc);
+
+          if (!active && V_pack >= V_knee && soc_ok) {
             active = true;
             bulk_latched = false;                                           // new session
             flat_curve_warned = false;                                      // new session
@@ -307,29 +419,33 @@ interval:
                 ? id(yambms${yambms_id}_requested_charge_current).state
                 : I_max;
             I_anchor = fminf(I_knee, I_ccl);
-          } else if (active && V_pack <= (V_knee - V_hyst)) {
+          } else if (active && !bulk_latched && V_pack <= (V_knee - V_hyst)) {
+            active = false;
+            bulk_latched = false;
+          } else if (active && bulk_latched && V_pack <= V_release_post_bulk) {
             active = false;
             bulk_latched = false;
           } else if (active && !bulk_latched && V_pack >= V_bulk) {
-            bulk_latched = true;                                            // sudden drop to I_balance
+            bulk_latched = true;                                            // drop to I_balance
           }
 
           //--------------------------------------------------------------------
           // Desired charge current (curve vs pack voltage; exp from substitution)
           //--------------------------------------------------------------------
           if (active) {
-            // Bulk latch or EOC (incl. early EOC before bulk) → Balance Current
             if (bulk_latched || eoc_done) {
+              // Bulk latch or post-EOC: Balance Current (or Dyn live) until
+              // session releases at max(float − 0.4 V, Rebulk V.)
               I_target = I_balance;
             } else {
               float p = (V_pack - V_knee) / (V_bulk - V_knee);              // 0 at knee → 1 at bulk
               p = fmaxf(0.0f, fminf(p, 1.0f));                              // below knee (hyst band): hold I_anchor
               const float curve = powf(1.0f - p, ${auto_ccl_ct_curve_exp}); // 1.0 = linear
               // Never let the curve end above the left end (I_anchor may be
-              // min(knee amps, current CCL); bulk C-rate must not invert the taper).
+              // min(knee amps, current CCL); Bulk Amps must not invert the taper).
               const float I_end = fminf(I_bulk, I_anchor);
               if ((I_end >= I_anchor) && !flat_curve_warned) {
-                ESP_LOGW("yambms_debug", "Auto CCL CT: Bulk C-Rate >= effective Knee C-Rate/CCL — taper curve is flat this session (no-op)");
+                ESP_LOGW("yambms_debug", "Auto CCL CT: Bulk Amps >= effective Knee Amps/CCL — taper curve is flat this session (no-op)");
                 flat_curve_warned = true;
               }
               I_target = I_end + (I_anchor - I_end) * curve;                // I_anchor → I_end
@@ -340,9 +456,86 @@ interval:
             I_target = I_max;
           }
 
-          // Write custom_ccl every baton turn (0 when inactive so a prior taper cannot stick)
+          // Arming window: bulk-latched Balance Current path (through post-EOC
+          // until post-bulk release)
+          id(yambms${yambms_id}_auto_ccl_ct_balancing_active).publish_state(
+              active && bulk_latched);
+
+          // Write pipeline var every baton turn (0 when inactive)
           id(yambms${yambms_id}_var_auto_ccl_current_taper) = delta;
           id(yambms${yambms_id}_auto_ccl_ct_delta).publish_state(delta);
 
           // Pass the baton
           id(yambms${yambms_id}_var_charge_current_step)++;
+
+  #--------------------------------------------------------------------------
+  # Subroutine: Dynamic Balance Current — toward Bulk − ref offset (not a baton step)
+  #   Poll on yambms_update_interval; ±1 A at most once per step_s.
+  #   Pre-EOC: ±1 A. Post-EOC: reduce-only if pack rises above ref + band.
+  #--------------------------------------------------------------------------
+  - interval: ${yambms_update_interval}
+    then:
+      - lambda: |-
+          static bool     was_armed    = false;
+          static float    I_live       = NAN;   // hunt value (diagnostic + baton CCL)
+          static float    I_seed_seen  = NAN;   // last Balance Current used to (re)seed
+          static uint32_t last_step_ms = 0;     // last ±1 A change (or arm settle)
+
+          const bool switch_on = id(yambms${yambms_id}_switch_auto_ccl_ct_vhold).state;
+          const bool window_on = id(yambms${yambms_id}_auto_ccl_ct_balancing_active).state;
+          const bool armed     = switch_on && window_on;
+          const bool eoc_done  = id(yambms${yambms_id}_var_eoc);
+
+          const float I_min = id(yambms${yambms_id}_number_auto_ccl_ct_vhold_i_min).state;
+          const float I_max = id(yambms${yambms_id}_number_auto_ccl_ct_vhold_i_max).state;
+          constexpr uint32_t step_ms = (uint32_t) (${auto_ccl_ct_vhold_step_s} * 1000);
+
+          // Idle / disarmed: drop hunt; mirror seed onto diagnostic
+          if (!armed) {
+            was_armed = false;
+            I_live = NAN;
+            I_seed_seen = NAN;
+            last_step_ms = 0;
+            if (id(yambms${yambms_id}_number_auto_ccl_ct_balance_a).has_state() &&
+                !isnan(id(yambms${yambms_id}_number_auto_ccl_ct_balance_a).state)) {
+              id(yambms${yambms_id}_auto_ccl_ct_vhold_a).publish_state(
+                  id(yambms${yambms_id}_number_auto_ccl_ct_balance_a).state);
+            }
+            return;
+          }
+
+          // Seed = initial value only (not a ceiling). Re-seed on arm or when
+          // the Balance Current number changes while hunting.
+          const float I_seed = roundf(id(yambms${yambms_id}_number_auto_ccl_ct_balance_a).state);
+          const float i_lo = fminf(I_min, I_max);
+          const float i_hi = fmaxf(I_min, I_max);
+
+          if (!was_armed || isnan(I_seed_seen) || (I_seed != I_seed_seen)) {
+            I_live = fmaxf(i_lo, fminf(I_seed, i_hi));
+            I_seed_seen = I_seed;
+            id(yambms${yambms_id}_auto_ccl_ct_vhold_a).publish_state(I_live);
+            last_step_ms = millis();                              // settle before ±1 A
+            was_armed = true;
+            return;
+          }
+
+          const float V_bulk = id(yambms${yambms_id}_bulk_voltage).state;
+          const float V_ref  = V_bulk - ${auto_ccl_ct_vhold_ref_offset_v};
+          const float V_pack = id(yambms${yambms_id}_auto_ccl_ct_voltage).has_state()
+              ? id(yambms${yambms_id}_auto_ccl_ct_voltage).state
+              : id(yambms${yambms_id}_total_voltage).state;
+          constexpr float V_band = ${auto_ccl_ct_vhold_band_v};
+
+          I_live = fmaxf(i_lo, fminf(I_live, i_hi));
+
+          const bool want_down = (V_pack > (V_ref + V_band));
+          const bool want_up   = (!eoc_done && V_pack < (V_ref - V_band));
+          if ((want_down || want_up) && (millis() - last_step_ms >= step_ms)) {
+            if (want_down)
+              I_live = fmaxf(i_lo, I_live - 1.0f);                // rising → reduce CCL
+            else
+              I_live = fminf(i_hi, I_live + 1.0f);                // pre-EOC only: falling → increase
+            last_step_ms = millis();
+          }
+
+          id(yambms${yambms_id}_auto_ccl_ct_vhold_a).publish_state(I_live);
