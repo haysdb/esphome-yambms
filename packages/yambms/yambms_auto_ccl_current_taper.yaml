@@ -22,14 +22,14 @@
 #
 # Purpose:
 #   1) Taper CCL from knee to bulk so the pack reaches bulk cleanly.
-#   2) At bulk latch: drop CCL to Balance Current.
-#   3) After EOC: keep CCL at Balance Current (or Dyn hunt) until charging
+#   2) At EOC latch: drop CCL to Balance Current.
+#   3) Keep CCL at Balance Current (or Dyn hunt) until charging
 #      instruction returns to Bulk (Force Bulk, Rebulk V/SoC/days, force charge),
 #      then release. Voltage-only Rebulk is inadequate (Force Bulk / Rebulk SoC
 #      can re-enter Bulk above Rebulk V.).
 #   4) Session release:
-#        - Before bulk: pack ≤ knee − hysteresis (~0.2 V @ 16S)
-#        - After bulk:  charging_instruction returns to Bulk (after Float/Stop)
+#        - Before EOC: pack ≤ knee − hysteresis (~0.2 V @ 16S)
+#        - After EOC:  charging_instruction returns to Bulk (after Float/Stop)
 #   5) Do not activate until battery SoC ≥ Min SoC number (default 95%).
 #   6) Optional Dynamic Balance Current (second interval, not a baton step):
 #      - Seeds from Balance Current number (never modifies that number).
@@ -40,7 +40,7 @@
 #
 # Publishes:
 #   binary_sensor …_auto_ccl_ct_balancing_active
-#     = CT session active && bulk latched (through post-EOC until Bulk again)
+#     = EOC latched (through post-EOC until Bulk again)
 #
 # Contract with yambms_core.yaml (upstream/dev):
 #   - Participates in Auto CCL STEP pipeline
@@ -162,7 +162,7 @@ number:
     entity_category: config
     icon: mdi:current-dc
 
-  # Balance current seed (A) while latched at bulk / after EOC
+  # Balance current seed (A) while latched after EOC
   # Dynamic Balance Current reads this as seed only and never modifies it.
   # Min/max scale with capacity at runtime (see interval); 0–50 are placeholders.
   # Keep above Cut-Off current deadband (yambms_current_deadband_crate × capacity).
@@ -298,7 +298,7 @@ binary_sensor:
 
 interval:
   #--------------------------------------------------------------------------
-  # Main: Auto CCL baton — taper curve + Balance Current after bulk latch
+  # Main: Auto CCL baton — taper curve + Balance Current after EOC latch
   #--------------------------------------------------------------------------
   - interval: ${yambms_update_interval}
     then:
@@ -307,7 +307,7 @@ interval:
           // Internal state
           //--------------------------------------------------------------------
           static bool  active            = false;   // At/above knee this session
-          static bool  bulk_latched      = false;   // Pack has touched bulk this session
+          static bool  eoc_latched       = false;   // EOC completed this session
           static bool  saw_non_bulk      = false;   // Seen Float/Stop after latch (armed for Bulk return)
           static float I_anchor          = NAN;     // CCL at knee (left end of curve)
           static bool  flat_curve_warned = false;   // One-shot log guard for a flat (no-op) taper curve
@@ -324,7 +324,7 @@ interval:
           //--------------------------------------------------------------------
           if (!id(yambms${yambms_id}_switch_auto_ccl_current_taper).state) {
             active = false;
-            bulk_latched = false;
+            eoc_latched = false;
             saw_non_bulk = false;
             id(yambms${yambms_id}_auto_ccl_ct_delta).publish_state(0.0f);
             id(yambms${yambms_id}_auto_ccl_ct_balancing_active).publish_state(false);
@@ -370,7 +370,7 @@ interval:
           const bool  eoc_done  = id(yambms${yambms_id}_var_eoc);                               // EOC reached
           const float V_hyst    = 0.0125f * ${yambms_cell_count};                               // knee hysteresis (0.2 V @ 16S)
           const float min_soc   = id(yambms${yambms_id}_number_auto_ccl_ct_min_soc).state;
-          // Post-bulk release: charging_instruction returns to Bulk (not SMA vs Rebulk V.)
+          // Post-EOC release: charging_instruction returns to Bulk (not SMA vs Rebulk V.)
           const bool  instr_bulk = id(yambms${yambms_id}_charging_instruction).has_state() &&
                                    (id(yambms${yambms_id}_charging_instruction).state == "Bulk");
 
@@ -384,7 +384,7 @@ interval:
           //--------------------------------------------------------------------
           if (isnan(V_knee) || isnan(V_bulk) || isnan(V_pack)) {
             active = false;
-            bulk_latched = false;
+            eoc_latched = false;
             saw_non_bulk = false;
             id(yambms${yambms_id}_auto_ccl_ct_delta).publish_state(0.0f);
             id(yambms${yambms_id}_auto_ccl_ct_balancing_active).publish_state(false);
@@ -398,7 +398,7 @@ interval:
           //--------------------------------------------------------------------
           if (V_knee >= (V_bulk - V_hyst)) {
             active = false;
-            bulk_latched = false;
+            eoc_latched = false;
             saw_non_bulk = false;
             id(yambms${yambms_id}_auto_ccl_ct_delta).publish_state(0.0f);
             id(yambms${yambms_id}_auto_ccl_ct_balancing_active).publish_state(false);
@@ -408,17 +408,23 @@ interval:
 
           //--------------------------------------------------------------------
           // Session: activate at knee + min SoC
-          //   Before bulk: release at knee − hysteresis
-          //   After bulk:  release when charging_instruction returns to Bulk
-          //                (must have seen Float/Stop first — latch itself is
-          //                still Bulk through Cut-Off/Balancing)
+          //   Before EOC: release at knee − hysteresis
+          //   At EOC:     latch even if slow charging stalled below bulk
+          //   After EOC:  release when charging_instruction returns to Bulk
+          //               after first seeing Float/Stop
           //--------------------------------------------------------------------
           const bool soc_ok = id(yambms${yambms_id}_battery_soc).has_state() &&
                               (id(yambms${yambms_id}_battery_soc).state >= min_soc);
 
-          if (!active && V_pack >= V_knee && soc_ok) {
+          if (!eoc_latched && eoc_done) {
+            // EOC is authoritative. Core can complete EOC below bulk when a
+            // slowly charged battery no longer accepts enough current to climb.
             active = true;
-            bulk_latched = false;                                           // new session
+            eoc_latched = true;
+            saw_non_bulk = !instr_bulk;
+          } else if (!active && V_pack >= V_knee && soc_ok) {
+            active = true;
+            eoc_latched = false;                                            // new session
             saw_non_bulk = false;
             flat_curve_warned = false;                                      // new session
             // Left end: min(knee amps, current CCL) — never start above Auto EOC (etc.)
@@ -426,30 +432,27 @@ interval:
                 ? id(yambms${yambms_id}_requested_charge_current).state
                 : I_max;
             I_anchor = fminf(I_knee, I_ccl);
-          } else if (active && !bulk_latched && V_pack <= (V_knee - V_hyst)) {
+          } else if (active && !eoc_latched && V_pack <= (V_knee - V_hyst)) {
             active = false;
-            bulk_latched = false;
+            eoc_latched = false;
             saw_non_bulk = false;
-          } else if (active && bulk_latched) {
+          } else if (active && eoc_latched) {
             if (!instr_bulk) {
               saw_non_bulk = true;                                          // EOC→Stop / Float
             } else if (saw_non_bulk) {
               // Returned to Bulk: Force Bulk, Rebulk V/SoC/days, force charge
               active = false;
-              bulk_latched = false;
+              eoc_latched = false;
               saw_non_bulk = false;
             }
-          } else if (active && !bulk_latched && V_pack >= V_bulk) {
-            bulk_latched = true;                                            // drop to I_balance
-            saw_non_bulk = false;
           }
 
           //--------------------------------------------------------------------
           // Desired charge current (curve vs pack voltage; exp from substitution)
           //--------------------------------------------------------------------
           if (active) {
-            if (bulk_latched || eoc_done) {
-              // Bulk latch or post-EOC: Balance Current (or Dyn live) until
+            if (eoc_latched || eoc_done) {
+              // EOC latch: Balance Current (or Dyn live) until
               // charging_instruction returns to Bulk.
               I_target = I_balance;
             } else {
@@ -471,10 +474,10 @@ interval:
             I_target = I_max;
           }
 
-          // Arming window: bulk-latched Balance Current path (through post-EOC
+          // Arming window: EOC-latched Balance Current path (through post-EOC
           // until charging_instruction returns to Bulk)
           id(yambms${yambms_id}_auto_ccl_ct_balancing_active).publish_state(
-              active && bulk_latched);
+              active && eoc_latched);
 
           // Write pipeline var every baton turn (0 when inactive)
           id(yambms${yambms_id}_var_auto_ccl_current_taper) = delta;
